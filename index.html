@@ -241,6 +241,188 @@
       const [showPaywall, setShowPaywall] = useState(false);
       const [cacheInfo, setCacheInfo] = useState(null);
 
+      // Real Spotify integration states
+      const [isRealConnected, setIsRealConnected] = useState(false);
+      const [spotifyToken, setSpotifyToken] = useState("");
+
+      // Restore Spotify token from LocalStorage on mount
+      useEffect(() => {
+        const savedToken = localStorage.getItem("lyrily_spotify_token");
+        if (savedToken) {
+          setIsRealConnected(true);
+          setSpotifyToken(savedToken);
+        }
+      }, []);
+
+      // Listen for message events from the Spotify OAuth popup window
+      useEffect(() => {
+        const handleMessage = (event) => {
+          const origin = event.origin;
+          if (!origin.endsWith(".run.app") && !origin.includes("localhost")) {
+            return;
+          }
+          if (event.data?.type === "OAUTH_AUTH_SUCCESS") {
+            const { accessToken } = event.data;
+            if (accessToken) {
+              setIsRealConnected(true);
+              setSpotifyToken(accessToken);
+              localStorage.setItem("lyrily_spotify_token", accessToken);
+            }
+          }
+        };
+        window.addEventListener("message", handleMessage);
+        return () => window.removeEventListener("message", handleMessage);
+      }, []);
+
+      // Periodically poll Spotify currently playing status if real connection is active
+      useEffect(() => {
+        if (!isRealConnected || !spotifyToken) return;
+
+        const fetchCurrentlyPlaying = async () => {
+          try {
+            const response = await fetch("https://api.spotify.com/v1/me/player/currently-playing", {
+              headers: {
+                "Authorization": `Bearer ${spotifyToken}`
+              }
+            });
+
+            if (response.status === 204) {
+              // No song playing currently
+              return;
+            }
+
+            if (response.status === 401) {
+              // Token expired, log out gracefully
+              setIsRealConnected(false);
+              setSpotifyToken("");
+              localStorage.removeItem("lyrily_spotify_token");
+              return;
+            }
+
+            if (!response.ok) {
+              return;
+            }
+
+            const data = await response.json();
+            if (data && data.item) {
+              const trackName = data.item.name;
+              const artistName = data.item.artists.map(a => a.name).join(", ");
+              const albumArtUrl = data.item.album?.images?.[0]?.url || "https://images.unsplash.com/photo-1614680376593-902f74fa0d41?w=300";
+              const progressSeconds = Math.floor(data.progress_ms / 1000);
+              const durationSeconds = Math.floor(data.item.duration_ms / 1000);
+              const isPlayingState = data.is_playing;
+
+              // Check if this song is already in our catalog
+              const existingSong = songs.find(s => 
+                s.title.toLowerCase() === trackName.toLowerCase() && 
+                s.artist.toLowerCase() === artistName.toLowerCase()
+              );
+
+              if (existingSong) {
+                // Only update when changed to prevent state loops
+                setActiveSong(existingSong);
+                setProgress(progressSeconds);
+                setIsPlaying(isPlayingState);
+              } else {
+                // It's a brand new song! Trigger Gemini auto-lyrics & translation sync dynamically!
+                const newSongId = `spotify_${data.item.id || Date.now()}`;
+                
+                const tempSong = {
+                  id: newSongId,
+                  title: trackName,
+                  artist: artistName,
+                  album: data.item.album?.name || "Spotify Album",
+                  albumArt: albumArtUrl,
+                  duration: durationSeconds,
+                  lyrics: [
+                    { time: "00:00.00", seconds: 0, text: `Connecting to Spotify Live...`, translation: `Spotify Canlı Yayınına Bağlanılıyor...` },
+                    { time: "00:03.00", seconds: 3, text: `Syncing lyrics & translations via Gemini API...`, translation: `Şarkı sözleri ve Türkçe çeviriler Gemini API ile senkronize ediliyor...` }
+                  ]
+                };
+
+                // Add to library
+                setSongs(prev => [tempSong, ...prev]);
+                setActiveSong(tempSong);
+                setProgress(progressSeconds);
+                setIsPlaying(isPlayingState);
+
+                // Auto-fetch using backend LRC Generator
+                try {
+                  const res = await fetch("/api/generate-lrc", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      title: trackName,
+                      artist: artistName,
+                      style: overlay.translationStyle
+                    })
+                  });
+                  if (res.ok) {
+                    const result = await res.json();
+                    if (result.lyrics && result.lyrics.length > 0) {
+                      const formattedLyrics = result.lyrics.map(line => ({
+                        time: line.time,
+                        seconds: parseLrcTimeToSeconds(line.time),
+                        text: line.text,
+                        translation: line.translation
+                      }));
+
+                      setSongs(prev => prev.map(s => s.id === newSongId ? {
+                        ...s,
+                        lyrics: formattedLyrics
+                      } : s));
+                    }
+                  }
+                } catch (err) {
+                  console.error("Auto-sync API error:", err);
+                }
+              }
+            }
+          } catch (err) {
+            console.error("Error polling currently playing track from Spotify:", err);
+          }
+        };
+
+        fetchCurrentlyPlaying();
+        const interval = setInterval(fetchCurrentlyPlaying, 4000); // Check every 4s
+        return () => clearInterval(interval);
+      }, [isRealConnected, spotifyToken, songs, overlay.translationStyle]);
+
+      const handleConnectSpotify = async () => {
+        try {
+          const redirectUri = `${window.location.origin}/auth/callback`;
+          const response = await fetch(`/api/spotify/auth-url?redirectUri=${encodeURIComponent(redirectUri)}`);
+          if (!response.ok) {
+            throw new Error("Giriş adresi sunucudan alınamadı.");
+          }
+          const { url } = await response.json();
+          
+          const width = 600;
+          const height = 700;
+          const left = window.screen.width / 2 - width / 2;
+          const top = window.screen.height / 2 - height / 2;
+          
+          const popup = window.open(
+            url,
+            "spotify_oauth_popup",
+            `width=${width},height=${height},top=${top},left=${left},resizable=yes,scrollbars=yes`
+          );
+          
+          if (!popup) {
+            alert("Lütfen popup engelleyiciyi devre dışı bırakıp tekrar deneyin.");
+          }
+        } catch (err) {
+          console.error("Spotify OAuth redirect url error:", err);
+          alert("Spotify bağlantısı başlatılamadı: " + err.message);
+        }
+      };
+
+      const handleDisconnectSpotify = () => {
+        setIsRealConnected(false);
+        setSpotifyToken("");
+        localStorage.removeItem("lyrily_spotify_token");
+      };
+
       // Developer Tab selection
       const [activeDevTab, setActiveDevTab] = useState("overlay");
       const [copied, setCopied] = useState(false);
@@ -464,10 +646,31 @@
               </div>
             </div>
 
-            <div className="hidden md:flex items-center gap-6 text-xs text-gray-400 font-medium">
+            <div className="hidden md:flex items-center gap-4 text-xs text-gray-400 font-medium">
               <span className="hover:text-white transition-colors cursor-pointer">Rehber</span>
               <span className="hover:text-white transition-colors cursor-pointer">Özellikler</span>
               <span className="hover:text-white transition-colors cursor-pointer">API Sürümleri</span>
+              
+              {isRealConnected ? (
+                <button
+                  onClick={handleDisconnectSpotify}
+                  className="bg-red-500/10 border border-red-500/20 hover:bg-red-500 hover:text-white text-red-400 px-4 py-2 rounded-xl text-xs transition-all cursor-pointer font-bold flex items-center gap-1.5"
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse"></span>
+                  Bağlantıyı Kes
+                </button>
+              ) : (
+                <button
+                  onClick={handleConnectSpotify}
+                  className="bg-[#1db954] hover:bg-[#1ed760] text-black px-4 py-2 rounded-xl text-xs font-extrabold flex items-center gap-1.5 shadow-[0_0_15px_rgba(29,185,84,0.3)] transition-all hover:scale-[1.03] active:scale-[0.97] cursor-pointer"
+                >
+                  <svg className="w-3.5 h-3.5 fill-current shrink-0" viewBox="0 0 24 24">
+                    <path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.49 17.3c-.22.36-.68.47-1.04.25-2.92-1.78-6.61-2.18-10.97-1.18-.4.09-.82-.16-.91-.57-.09-.4.16-.82.57-.91 4.77-1.09 8.84-.63 12.1 1.36.36.22.48.68.25 1.05zm1.47-3.26c-.28.45-.87.6-1.32.32-3.34-2.05-8.44-2.65-12.39-1.45-.51.15-1.04-.14-1.2-.65-.15-.51.14-1.04.65-1.2 4.51-1.37 10.13-.7 13.94 1.63.45.29.6.87.32 1.35zm.1-3.4C15.42 8.49 9.4 8.29 5.92 9.35c-.56.17-1.15-.15-1.32-.71-.17-.56.15-1.15.71-1.32 4-1.21 10.64-.98 15.17 1.71.51.3 1.68.96.38 1.48-.5.3-1.16.12-1.46-.38z"/>
+                  </svg>
+                  Spotify ile Bağlan
+                </button>
+              )}
+              
               <a href="#developer" className="bg-[#18181b] border border-white/10 text-white px-4 py-2 rounded-xl hover:bg-zinc-800 transition-all font-semibold">
                 Mobil Entegrasyon Kodları
               </a>
@@ -754,10 +957,36 @@
 
                         <div className="flex-1 flex flex-col items-center justify-center py-4">
                           <img src={activeSong.albumArt} alt={activeSong.title} className={`w-36 h-36 rounded-2xl object-cover shadow-2xl border border-gray-950 transition-transform duration-700 ${isPlaying ? "scale-105" : "scale-95"}`} />
-                          <div className="text-center mt-4 w-full px-4">
+                          <div className="text-center mt-2 w-full px-4">
                             <h3 className="text-sm font-bold text-white truncate">{activeSong.title}</h3>
                             <p className="text-xs text-gray-400 truncate mt-0.5">{activeSong.artist}</p>
-                            <span className="text-[8px] text-[#1ed760] font-mono mt-1.5 bg-[#1ed760]/10 border border-[#1ed760]/20 px-2 py-0.5 rounded-full inline-block">Lyrily Active</span>
+                            
+                            {isRealConnected ? (
+                              <div className="flex flex-col items-center gap-1.5 mt-2.5">
+                                <p className="text-[9px] text-[#1ed760] font-mono tracking-wide uppercase bg-[#1ed760]/10 border border-[#1ed760]/20 px-2.5 py-0.5 rounded-full inline-flex items-center gap-1">
+                                  <span className="w-1.5 h-1.5 rounded-full bg-[#1db954] animate-pulse"></span>
+                                  Gerçek Spotify Hesabın Bağlı
+                                </p>
+                                <button 
+                                  onClick={handleDisconnectSpotify}
+                                  className="text-[9px] text-gray-500 hover:text-red-400 underline transition-colors cursor-pointer"
+                                >
+                                  Bağlantıyı Kes
+                                </button>
+                              </div>
+                            ) : (
+                              <div className="flex flex-col items-center gap-2 mt-2 px-2">
+                                <button 
+                                  onClick={handleConnectSpotify}
+                                  className="w-full bg-[#1db954] hover:bg-[#1ed760] text-black font-extrabold text-[10px] py-1.5 px-3 rounded-xl flex items-center justify-center gap-1.5 shadow-[0_4px_12px_rgba(29,185,84,0.3)] transition-all hover:scale-[1.02] active:scale-[0.98] cursor-pointer"
+                                >
+                                  🟢 Spotify Hesabını Bağla
+                                </button>
+                                <span className="text-[8px] text-gray-400 max-w-[200px] leading-normal">
+                                  Spotify hesabını bağlayarak o an çalan şarkıyı otomatik Türkçe altyazılı yap!
+                                </span>
+                              </div>
+                            )}
                           </div>
                         </div>
 
